@@ -27,71 +27,141 @@ const upload = multer({
   }
 });
 
-async function ensureMaxSize(sharpInstance, format, initialQuality, maxWidth = null) {
-  let quality = initialQuality;
-  let width = maxWidth;
-  let buffer;
-  let attempts = 0;
-  const maxAttempts = 15;
-
-  while (attempts < maxAttempts) {
-    try {
-      let instance = sharpInstance.clone();
-
-      if (width) {
-        instance = instance.resize({ width, withoutEnlargement: true });
-      }
-
-      switch (format.toLowerCase()) {
-        case 'jpeg':
-        case 'jpg':
-          instance = instance.jpeg({ quality, mozjpeg: true });
-          break;
-        case 'png':
-          instance = instance.png({ quality, compressionLevel: 9 });
-          break;
-        case 'webp':
-          instance = instance.webp({ quality });
-          break;
-        case 'avif':
-          instance = instance.avif({ quality });
-          break;
-      }
-
-      buffer = await instance.toBuffer();
-
-      if (buffer.length <= MAX_OUTPUT_SIZE) {
-        return buffer;
-      }
-
-      attempts++;
-
-      if (quality > 60) {
-        quality -= 10;
-      } else if (!width) {
-        width = 8000;
-      } else if (width > 2000) {
-        width = Math.floor(width * 0.8);
-      } else {
-        quality = Math.max(50, quality - 5);
-      }
-
-      console.log(`Tentative ${attempts}: qualité=${quality}, largeur=${width || 'originale'}, taille=${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
-
-    } catch (error) {
-      console.error('Erreur lors de l\'optimisation:', error);
-      throw error;
-    }
+async function fastOptimize(sharpInstance, format, quality, maxWidth = null) {
+  const startTime = Date.now();
+  
+  const metadata = await sharpInstance.metadata();
+  const originalPixels = metadata.width * metadata.height;
+  
+  let targetWidth = maxWidth || metadata.width;
+  
+  if (originalPixels > 100000000) {
+    targetWidth = Math.min(targetWidth, 10000);
+  } else if (originalPixels > 50000000) {
+    targetWidth = Math.min(targetWidth, 12000);
+  } else if (originalPixels > 20000000) {
+    targetWidth = Math.min(targetWidth, 15000);
   }
-
-  console.warn('Impossible de réduire sous 9 MB après 15 tentatives');
+  
+  let instance = sharpInstance.clone();
+  
+  if (targetWidth < metadata.width) {
+    instance = instance.resize({
+      width: targetWidth,
+      withoutEnlargement: true,
+      kernel: 'cubic',
+      fastShrinkOnLoad: true
+    });
+  }
+  
+  instance = instance
+    .withMetadata(false)
+    .rotate();
+  
+  switch (format.toLowerCase()) {
+    case 'jpeg':
+    case 'jpg':
+      instance = instance.jpeg({
+        quality,
+        progressive: true,
+        optimizeCoding: true,
+        mozjpeg: true,
+        chromaSubsampling: '4:2:0'
+      });
+      break;
+    case 'png':
+      instance = instance.png({
+        quality,
+        compressionLevel: 6,
+        palette: true,
+        effort: 4
+      });
+      break;
+    case 'webp':
+      instance = instance.webp({
+        quality,
+        effort: 4,
+        smartSubsample: true
+      });
+      break;
+    case 'avif':
+      instance = instance.avif({
+        quality,
+        effort: 4
+      });
+      break;
+  }
+  
+  let buffer = await instance.toBuffer();
+  
+  if (buffer.length <= MAX_OUTPUT_SIZE) {
+    const elapsed = Date.now() - startTime;
+    console.log(`✅ Optimisé en ${(elapsed / 1000).toFixed(2)}s - Taille: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
+    return buffer;
+  }
+  
+  console.log(`⚠️ Première tentative trop grosse (${(buffer.length / 1024 / 1024).toFixed(2)} MB), réduction...`);
+  
+  const reductionRatio = Math.sqrt(MAX_OUTPUT_SIZE / buffer.length) * 0.95;
+  targetWidth = Math.floor(targetWidth * reductionRatio);
+  quality = Math.max(60, Math.floor(quality * 0.85));
+  
+  instance = sharpInstance.clone()
+    .resize({
+      width: targetWidth,
+      withoutEnlargement: true,
+      kernel: 'cubic',
+      fastShrinkOnLoad: true
+    })
+    .withMetadata(false)
+    .rotate();
+  
+  switch (format.toLowerCase()) {
+    case 'jpeg':
+    case 'jpg':
+      instance = instance.jpeg({
+        quality,
+        progressive: true,
+        optimizeCoding: true,
+        mozjpeg: true,
+        chromaSubsampling: '4:2:0'
+      });
+      break;
+    case 'png':
+      instance = instance.png({
+        quality,
+        compressionLevel: 6,
+        palette: true,
+        effort: 4
+      });
+      break;
+    case 'webp':
+      instance = instance.webp({
+        quality,
+        effort: 4,
+        smartSubsample: true
+      });
+      break;
+    case 'avif':
+      instance = instance.avif({
+        quality,
+        effort: 4
+      });
+      break;
+  }
+  
+  buffer = await instance.toBuffer();
+  
+  const elapsed = Date.now() - startTime;
+  console.log(`✅ Optimisé en ${(elapsed / 1000).toFixed(2)}s - Taille finale: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
+  
   return buffer;
 }
 
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    message: 'API d\'optimisation d\'images est active',
+    message: 'API d\'optimisation d\'images est active (MODE RAPIDE)',
     maxOutputSize: '9 MB',
     endpoints: {
       optimize: 'POST /optimize - Optimiser une image (max 9 MB en sortie)',
@@ -108,13 +178,14 @@ app.post('/optimize', upload.single('image'), async (req, res) => {
     }
 
     const quality = parseInt(req.body.quality) || 80;
-    const format = req.body.format || 'webp';
+    const format = req.body.format || 'jpeg';
 
     let sharpInstance = sharp(req.file.buffer, {
-      limitInputPixels: false
+      limitInputPixels: false,
+      sequentialRead: true
     });
 
-    const optimizedBuffer = await ensureMaxSize(sharpInstance, format, quality);
+    const optimizedBuffer = await fastOptimize(sharpInstance, format, quality);
     
     const originalSize = req.file.buffer.length;
     const optimizedSize = optimizedBuffer.length;
@@ -142,23 +213,14 @@ app.post('/resize', upload.single('image'), async (req, res) => {
     const width = parseInt(req.body.width);
     const height = parseInt(req.body.height);
     const quality = parseInt(req.body.quality) || 80;
-    const format = req.body.format || 'webp';
-    const fit = req.body.fit || 'inside';
+    const format = req.body.format || 'jpeg';
 
     let sharpInstance = sharp(req.file.buffer, {
-      limitInputPixels: false
+      limitInputPixels: false,
+      sequentialRead: true
     });
 
-    if (width || height) {
-      sharpInstance = sharpInstance.resize({
-        width: width || null,
-        height: height || null,
-        fit: fit,
-        withoutEnlargement: true
-      });
-    }
-
-    const optimizedBuffer = await ensureMaxSize(sharpInstance, format, quality, width);
+    const optimizedBuffer = await fastOptimize(sharpInstance, format, quality, width || height);
     
     const originalSize = req.file.buffer.length;
     const optimizedSize = optimizedBuffer.length;
@@ -183,14 +245,15 @@ app.post('/convert', upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'Aucune image fournie' });
     }
 
-    const format = req.body.format || 'webp';
+    const format = req.body.format || 'jpeg';
     const quality = parseInt(req.body.quality) || 80;
 
     let sharpInstance = sharp(req.file.buffer, {
-      limitInputPixels: false
+      limitInputPixels: false,
+      sequentialRead: true
     });
 
-    const optimizedBuffer = await ensureMaxSize(sharpInstance, format, quality);
+    const optimizedBuffer = await fastOptimize(sharpInstance, format, quality);
     
     res.set('Content-Type', `image/${format}`);
     res.set('X-Optimized-Size', optimizedBuffer.length);
@@ -213,7 +276,7 @@ app.use((error, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+  console.log(`🚀 Serveur démarré sur le port ${PORT} (MODE RAPIDE)`);
   console.log(`📍 URL: http://localhost:${PORT}`);
   console.log(`✅ Taille maximale de sortie: 9 MB`);
 });
